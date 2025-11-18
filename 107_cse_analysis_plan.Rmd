@@ -1,0 +1,560 @@
+---
+title: "105_cse_pilot_analysis"
+author: "Peter Czingraber"
+date: "2025-11-04"
+output: html_document
+---
+
+## Raw to clean
+
+## Loading packages
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(stringr)
+```
+
+
+#Loading the data
+```{r}
+raw_df = read.csv("inlab_pilot.csv")
+```
+
+#Data cleaning - flagging practice trials
+```{r}
+raw_df = raw_df %>% 
+  group_by(subj_code) %>% 
+  mutate(block_marker = str_detect(stimulus, regex("Blokk\\s*1\\s*kezdődik", ignore_case = TRUE)),
+         start_seen = cummax(trial_index == 0),
+         marker_seen = cummax(block_marker),
+         trial_exp = if_else(start_seen == 1 & marker_seen == 0, "practice", "experimental")) %>% 
+  ungroup()
+```
+
+#Data cleaning - color trials + flagging previous trials
+
+```{r}
+raw_df = raw_df %>% 
+  mutate(color = str_extract(name, "black|red"),
+         prev_congruency = lag(congruency, n = 4),
+         prev_correct = lag(correct, n = 4),
+         correct = ifelse(correct == "true", 1, 0),
+         prev_correct = ifelse(prev_correct == "true", 1, 0),
+         first_trial = ifelse(lag(str_detect(stimulus, "Blokk \\d+ kezdődik"), 4) == TRUE, 1, 0),
+         rt = as.numeric(rt))
+```
+
+#Accuracy filter
+
+```{r}
+accuracy_df = raw_df %>% 
+  filter(trial_exp != "practice", task == "probe", first_trial != 1) %>% 
+  group_by(subj_code) %>% 
+  summarise(all_accuracy = mean(correct))
+
+raw_df = raw_df %>% 
+  left_join(accuracy_df, by = "subj_code")%>% 
+  filter(all_accuracy > 0.60)
+
+```
+
+#Sampling equal number of black trials for the number of red trials
+```{r}
+filtered_data = raw_df %>% 
+  filter(trial_exp != "practice", task == "probe", first_trial != 1)
+
+filtered_data = filtered_data %>% 
+  group_by(subj_code) %>% 
+  group_modify(~ {
+    .x$black_flagged_trial = NA_integer_   
+    
+    n_red = sum(.x$color == "red")
+    black_rows = which(.x$color == "black")
+    
+    flagged_rows = sample(black_rows, min(n_red, length(black_rows)))
+    
+    
+    .x$black_flagged_trial[black_rows] = 0   
+    .x$black_flagged_trial[flagged_rows] = 1 
+    .x$black_flagged_trial[.x$color == "red"] = 2
+    
+    .x
+  }) %>% 
+  ungroup()
+
+filtered_data %>% 
+  count(black_flagged_trial)
+```
+
+
+#Extracting demography data
+
+```{r}
+demography_data = raw_df %>%
+  filter(trial_type %in% c("survey-text", "survey-multi-choice"))
+    
+demography_data = demography_data %>%
+  select(response, subj_code)
+
+demography_data = demography_data %>%
+  mutate(age = str_extract(response, '"age":"\\d+"') %>%
+      str_extract("\\d+") %>%
+      as.numeric(),
+    
+    gender = str_extract(response, '"gender":"[^"]+"') %>%
+      str_remove_all('"gender":"') %>%
+      str_remove('"'))
+
+demography_data = demography_data %>%
+  select(-response)
+
+demography_data = demography_data %>%
+  group_by(subj_code) %>%
+  summarize(
+    age = coalesce(age[1], age[2]),
+    gender = coalesce(gender[1], gender[2]))
+```
+
+#Data cleaning - filtering data
+```{r}
+processed_df = filtered_data %>% 
+  filter(trial_exp != "practice", task == "probe", first_trial != 1, black_flagged_trial != 0, correct == 1, prev_correct == 1)
+
+processed_df = processed_df %>% 
+  select(-stimulus,
+         -response,
+         -trial_type,
+         -trial_index,
+         -plugin_version,
+         -time_elapsed,
+         -success,
+         -question_order,
+         -correct_response,
+         -block_marker,
+         -start_seen,
+         -marker_seen,
+         -trial_exp,
+         -first_trial,
+         -name)
+
+processed_df = processed_df %>% 
+  filter(rt > 150)
+```
+
+#Statistical analysis
+
+##Basic analysis
+
+```{r}
+dstats = function(x, na.omit=FALSE){
+  if (na.omit)
+  x = x[!is.na(x)]
+  min = min(x)
+  max = max(x)
+  m = mean(x)
+  median = median(x)
+  n = length(x)
+  stds = sd(x)
+  skew = 3*(m-median)/stds
+  kurt = (length(x) * sum((x - mean(x))^4)) / (sum((x - mean(x))^2)^2) - 3
+
+  
+#Return all calculated values to vectors
+  return(c(
+    min = min,
+    max = max,
+    mean = m,
+    median = median,
+    sd = stds,
+    skewness = skew,
+    kurtosis = kurt
+  ))
+}
+```
+
+#Descriptive statistics on aggregated RT values
+
+```{r}
+mean_rt_df = processed_df %>% 
+  group_by(subj_code) %>% 
+  summarise(mean_RT_congruent = mean(rt[congruency == "congruent"], na.rm = TRUE),
+            mean_RT_incongruent = mean(rt[congruency == "incongruent"], na.rm = TRUE))
+
+```
+
+```{r}
+myvars = c ("mean_RT_congruent", "mean_RT_incongruent")
+sapply(mean_rt_df[myvars], dstats)
+```
+
+#per participant CSE
+```{r}
+cse_plot_df = processed_df %>% 
+  group_by(subj_code, congruency, prev_congruency) %>% 
+  summarise(mean_RT = mean(rt))
+
+wide_df = cse_plot_df %>% 
+  pivot_wider(names_from = c(prev_congruency, congruency),
+              values_from = mean_RT)
+subject_cse = wide_df %>% 
+  mutate(CSE = (congruent_incongruent - congruent_congruent) - (incongruent_incongruent - incongruent_congruent))
+
+ggplot(subject_cse, aes(x = CSE)) +
+  geom_density(fill = "#011526", alpha = 0.25) +
+  scale_x_continuous(breaks = seq(floor(min(subject_cse$CSE)),
+                                  ceiling(max(subject_cse$CSE)),
+                                  by = 5))
+  theme_minimal()
+```
+
+#subj_cse_stats
+```{r}
+myvars = c("CSE")
+sapply(subject_cse[myvars], dstats)
+```
+
+#Normality of CSE values
+```{r}
+shapiro.test(subject_cse$CSE)
+```
+
+# H1 - Paired samples t-test
+
+```{r}
+t.test(mean_rt_df$mean_RT_congruent, mean_rt_df$mean_RT_incongruent, paired = T, alternative = "less")
+```
+
+#H2 - One samples t-test
+
+```{r}
+t.test(subject_cse$CSE, mu = 0, alternative = "greater")
+```
+
+#H3 - Paired samples t-test
+
+```{r}
+color_rt_df = processed_df %>% 
+  group_by(subj_code) %>% 
+  summarise(mean_RT_black = mean(rt[color == "black"], na.rm = TRUE),
+            mean_RT_red = mean(rt[color == "red"], na.rm = TRUE))
+```
+
+```{r}
+t.test(color_rt_df$mean_RT_black, color_rt_df$mean_RT_red, paired = T, alternative = "less")
+```
+
+#H4 - Paired samples t-test
+
+#Proper dataformat
+```{r}
+color_cse_df = processed_df %>% 
+  group_by(subj_code, congruency, prev_congruency, color) %>% 
+  summarise(mean_rt = mean(rt), .groups = "drop")
+```
+
+```{r}
+color_cse_df = color_cse_df %>% 
+  pivot_wider(names_from = c(prev_congruency, congruency, color),
+              values_from = mean_rt)
+
+subject_color_cse = color_cse_df %>% 
+  mutate(black_CSE = (congruent_incongruent_black - congruent_congruent_black) - (incongruent_incongruent_black - incongruent_congruent_black),
+         red_CSE = (congruent_incongruent_red - congruent_congruent_red) - (incongruent_incongruent_red - incongruent_congruent_red))
+```
+
+#Paired-samples t-test
+```{r}
+t.test(subject_color_cse$black_CSE, subject_color_cse$red_CSE, paired = T, alternative = "two.sided")
+```
+
+
+
+
+
+
+
+
+###Bayesian inference using Dienes's bayes factor function
+
+#H1
+#Run the frequentist stat
+```{r}
+t.test(mean_rt_df$mean_RT_congruent, mean_rt_df$mean_RT_incongruent, paired = T, alternative = "less")
+```
+
+#Store the test result as an object
+```{r}
+t_test_H1 = t.test(mean_rt_df$mean_RT_congruent, mean_rt_df$mean_RT_incongruent, paired = T, alternative = "less")
+```
+
+#Now we extract the needed values
+```{r}
+CE = mean_rt_df$mean_RT_congruent - mean_rt_df$mean_RT_incongruent
+obtained = as.numeric(t_test_H1$estimate) #mean difference
+se = t_test_H1$stderr #standard error
+dfdata = t_test_H1$parameter #degrees of freedom
+```
+
+#Calculate the bayes factor
+```{r}
+source("dienes_bayes.R")
+
+old_Bf(sd = se,
+   obtained = -obtained, 
+   dfdata = dfdata,
+   meanoftheory = 0,
+   sdtheory = 1 * sd(CE),  
+   dftheory = 10^10, 
+   tail = 1)
+
+h1_range = seq(from = 0.1, to = 20, by = 0.1)
+range_test = Bf_range(
+  sd = se,
+  obtained = -obtained,
+  likelihood = "normal",
+  modeloftheory = "normal",
+  modeoftheory = 0,
+  sdtheoryrange = h1_range,
+  tail = 1,
+  method = "new")
+ev_for_h1 = subset(data.frame(range_test), BF > 3)
+low_treshold_mcm = min(ev_for_h1$sdtheory)
+high_treshold_mcm = max(ev_for_h1$sdtheory)
+print(range_test)
+```
+
+#H2
+
+#Run the frequentist stat
+```{r}
+t.test(subject_cse$CSE, mu = 0, alternative = "greater")
+```
+
+#Store the test result as an object
+```{r}
+t_test_H2 = t.test(subject_cse$CSE, mu = 0, alternative = "greater")
+```
+
+#Now we extract the needed values
+```{r}
+CSE = subject_cse$CSE
+obtained_H2 = as.numeric(t_test_H2$estimate) 
+se_H2 = t_test_H2$stderr 
+dfdata_H2 = t_test_H2$parameter 
+```
+
+#Calculate the bayes factor
+```{r}
+source("dienes_bayes.R")
+
+old_Bf(sd = se_H2,
+   obtained = obtained_H2,  
+   dfdata = dfdata_H2,
+   meanoftheory = 0,
+   sdtheory = 0.5 * sd(CSE), 
+   dftheory = 10^10, 
+   tail = 1)
+
+h2_range = seq(from = 0.1, to = 20, by = 0.1)
+range_test_H2 = Bf_range(
+  sd = se_H2,
+  obtained = obtained_H2,
+  likelihood = "normal",
+  modeloftheory = "normal",
+  modeoftheory = 0,
+  sdtheoryrange = h2_range,
+  tail = 1,
+  method = "new")
+ev_for_h2 = subset(data.frame(range_test_H2), BF > 3)
+low_treshold_mcm = min(ev_for_h2$sdtheory)
+high_treshold_mcm = max(ev_for_h2$sdtheory)
+print(range_test_H2)
+```
+
+#H3
+
+#Run the frequentist stat
+```{r}
+t.test(color_rt_df$mean_RT_black, color_rt_df$mean_RT_red, paired = T, alternative = "less")
+```
+
+#Store the test result as an object
+```{r}
+t_test_H3 = t.test(color_rt_df$mean_RT_black, color_rt_df$mean_RT_red, paired = T, alternative = "less")
+```
+
+#Now we extract the needed values
+```{r}
+color_rt_diff = color_rt_df$mean_RT_black - color_rt_df$mean_RT_red
+obtained_H3 = as.numeric(t_test_H3$estimate) 
+se_H3 = t_test_H3$stderr 
+dfdata_H3 = t_test_H3$parameter 
+```
+
+#Calculate the bayes factor
+```{r}
+source("dienes_bayes.R")
+
+old_Bf(sd = se_H3,
+   obtained = -obtained_H3,  
+   dfdata = dfdata_H3,
+   meanoftheory = 0,
+   sdtheory = 0.2 * sd(color_rt_diff), 
+   dftheory = 10^10, 
+   tail = 1)
+
+h3_range = seq(from = 0.1, to = 20, by = 0.1)
+range_test_H3 = Bf_range(
+  sd = se_H3,
+  obtained = -obtained_H3,
+  likelihood = "normal",
+  modeloftheory = "normal",
+  modeoftheory = 0,
+  sdtheoryrange = h3_range,
+  tail = 1,
+  method = "new")
+ev_for_h3 = subset(data.frame(range_test_H3), BF > 3)
+low_treshold_mcm = min(ev_for_h3$sdtheory)
+high_treshold_mcm = max(ev_for_h3$sdtheory)
+print(range_test_H3)
+```
+
+#H4
+
+#Run the frequentist stat
+```{r}
+t.test(subject_color_cse$black_CSE, subject_color_cse$red_CSE, paired = T, alternative = "two.sided")
+```
+
+#Store the test result as an object
+```{r}
+t_test_H4 = t.test(subject_color_cse$black_CSE, subject_color_cse$red_CSE, paired = T, alternative = "two.sided")
+```
+
+#Now we extract the needed values
+```{r}
+color_cse_diff = subject_color_cse$black_CSE - subject_color_cse$red_CSE
+obtained_H4 = as.numeric(t_test_H4$estimate) 
+se_H4 = t_test_H4$stderr 
+dfdata_H4 = t_test_H4$parameter 
+```
+
+#Calculate the bayes factor
+```{r}
+source("dienes_bayes.R")
+
+old_Bf(sd = se_H4,
+   obtained = obtained_H4,  
+   dfdata = dfdata_H4,
+   meanoftheory = 0,
+   sdtheory = 0.2 * sd(color_cse_diff), 
+   dftheory = 10^10, 
+   tail = 2)
+
+h4_range = seq(from = 0.1, to = 50, by = 0.1)
+range_test_H4 = Bf_range(
+  sd = se_H4,
+  obtained = obtained_H4,
+  likelihood = "normal",
+  modeloftheory = "normal",
+  modeoftheory = 0,
+  sdtheoryrange = h4_range,
+  tail = 2,
+  method = "new")
+ev_for_h4 = subset(data.frame(range_test_H4), BF > 3)
+low_treshold_mcm = min(ev_for_h4$sdtheory)
+high_treshold_mcm = max(ev_for_h4$sdtheory)
+print(range_test_H4)
+```
+
+#Visualization
+
+##CE
+```{r}
+ce_rt = processed_df %>% 
+  group_by(subj_code, congruency) %>% 
+  summarise(mean_RT = mean(rt, na.rm = TRUE)) 
+```
+
+```{r}
+CE_violin = ggplot(ce_rt, aes(congruency, mean_RT, fill = congruency)) +
+  geom_violin(trim = TRUE, bounds = c(0, Inf), width = 0.5) +
+  geom_boxplot(width = 0.1, colour = c("black", "white"), outlier.shape = NA) +
+  labs(title = "Coungruency Effect", x = "Congruency", y = "Mean Reaction Time") +
+  papaja::theme_apa(base_family = "Times") +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("congruent" = "#a6cba4", "incongruent" = "#1A4C39"))
+#ggsave("ce_violin.png", plot = CE_violin, width = 16, height = 9, units = "cm", dpi = 320)
+print(CE_violin)
+```
+
+##CSE
+```{r}
+cse_plot_df = processed_df %>% 
+  group_by(subj_code, congruency, prev_congruency) %>% 
+  summarise(mean_RT = mean(rt))
+
+cse_summary_table = cse_plot_df %>% 
+  group_by (congruency, prev_congruency) %>% 
+  summarize(N = n(),
+            mean_rt = mean(mean_RT),
+            sd_rt = sd(mean_RT, na.rm = T),
+            se_rt = sd_rt/sqrt(N))
+```
+
+```{r}
+cse_plot = ggplot(cse_summary_table, aes(prev_congruency, mean_rt, color = congruency, group = congruency)) +
+  geom_point(size = 3) +
+  geom_path(linewidth = 1.2) +
+  geom_errorbar(aes(ymin = mean_rt - se_rt, ymax = mean_rt + se_rt), width = 0.2, linewidth = 1.2) +
+                      labs("Congruency-sequence Effect",
+                       x = "Previous Congruency",
+                       y = "Mean Reaction Time (ms)",
+                       colour = "Congruency") + 
+                  scale_colour_manual(values = c("#a6cba4", "#1A4C39")) +
+                  theme_minimal(base_size = 14) +
+                  theme(legend.position = "right",
+                        plot.title = element_text(hjust = 0.5, face = "bold"),
+                        panel.grid = element_blank(),
+                        axis.line = element_line(color = "grey", size = 1))
+#ggsave("overall_cse_plot.png", plot = cse_plot, width = 16, height = 9, units = "cm", dpi = 320)
+print(cse_plot)
+```
+
+```{r}
+cse_plot_data %>% 
+  ggplot()+
+  aes(y = grand_mean_rt, x = prev_congruency, colour = congruency, group = congruency)+
+  geom_point(size = 3) +
+  geom_path(linewidth = 1.2)+
+  geom_errorbar(aes(ymin = grand_mean_rt - se_rt, ymax = grand_mean_rt + se_rt), width = 0.2, linewidth = 0.8) +
+                  labs("Kongruencia-szekvencia hatás",
+                       x = "Előző próba kongruenciája",
+                       y = "Átlagos Reakcióidő (ms)",
+                       colour = "Congruency") + 
+                  scale_colour_manual(values = c("#82C4FF", "#011526")) +
+                  theme_minimal(base_size = 14) +
+                  theme(legend.position = "right",
+                        plot.title = element_text(hjust = 0.5, face = "bold"),
+                        panel.grid = element_blank(),
+                        axis.line = element_line(color = "grey", size = 1)) +
+  facet_grid(cols = vars(condition))
+ggsave("cse_plot.png", plot = last_plot(), width = 16, height = 9, units = "cm", dpi = 320)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

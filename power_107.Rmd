@@ -1,0 +1,19 @@
+---
+title: "105_cse_power_analysis"
+author: "Peter Czingraber"
+date: "2025-10-19"
+output: html_document
+---
+
+```{r}
+library(pwr)
+library(Superpower)
+```
+
+#To test wheteher there is a statistically significant difference between the mean reaction times of congruent and incongruent trials in different contingency conditions, we are going to use a paired samples t-test.
+```{r}
+pwr.t.test(d = 0.2, power = 0.80, sig.level = 0.05, type = "paired", alternative = "two.sided")
+```
+
+
+
